@@ -26,6 +26,62 @@ def _rbf_kernel_sum(vec_a: np.ndarray, vec_b: np.ndarray, sigma: float) -> float
     diff = vec_a[:, None] - vec_b[None, :]
     return float(np.exp(-sigma * diff * diff).sum())
 
+def _compute_neighbors(
+    data: np.ndarray, n_knn: int, dist_matrix: bool, preserve_ordering: bool
+) -> tuple[List[np.ndarray], float]:
+    n_samples = data.shape[0]
+    k = max(1, min(n_knn, n_samples))
+
+    if dist_matrix:
+        # Use provided distances to pick the closest neighbors.
+        sorted_indices = np.argsort(data, axis=1)
+        neighbor_indices = [row[:k] for row in sorted_indices]
+        sorted_distances = np.sort(data, axis=1)
+        max_scale = float(sorted_distances[:, k - 1].max())
+    elif preserve_ordering:
+        neighbor_indices = []
+        half_window = k // 2
+        for i in range(n_samples):
+            start = max(0, i - half_window)
+            stop = min(n_samples, i + half_window + 1)
+            neighbor_indices.append(np.arange(start, stop))
+        max_scale = float(data.max())
+    else:
+        diffs = data[:, None, :] - data[None, :, :]
+        distances = np.linalg.norm(diffs, axis=2)
+        sorted_indices = np.argsort(distances, axis=1)
+        neighbor_indices = [row[:k] for row in sorted_indices]
+        gathered = np.take_along_axis(distances, sorted_indices[:, k - 1 : k], axis=1)
+        max_scale = float(gathered.max())
+
+    return neighbor_indices, max_scale
+
+
+def _build_diagram(
+    subset: np.ndarray, *, distance_matrix: bool, max_dimension: int, max_scale: float
+) -> np.ndarray:
+    
+    thresh = max(max_scale, 1e-12)
+    dgms = ripser(
+        subset,
+        maxdim=max_dimension,
+        thresh=thresh,
+        distance_matrix=distance_matrix,
+    )["dgms"]
+
+    rows: List[List[float]] = []
+    for dim, diagram in enumerate(dgms):
+        if diagram.size == 0:
+            continue
+        births_deaths = np.asarray(diagram)
+        deaths = births_deaths[:, 1]
+        deaths = np.where(np.isinf(deaths), max_scale, deaths)
+        for birth, death in zip(births_deaths[:, 0], deaths):
+            rows.append([float(dim), float(birth), float(death)])
+    if not rows:
+        return np.zeros((0, 3), dtype=float)
+    return np.vstack(rows)
+
 
 def _kmeans_dist_fcps(
     distance: np.ndarray,
