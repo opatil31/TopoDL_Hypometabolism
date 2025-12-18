@@ -33,7 +33,6 @@ def _compute_neighbors(
     k = max(1, min(n_knn, n_samples))
 
     if dist_matrix:
-        # Use provided distances to pick the closest neighbors.
         sorted_indices = np.argsort(data, axis=1)
         neighbor_indices = [row[:k] for row in sorted_indices]
         sorted_distances = np.sort(data, axis=1)
