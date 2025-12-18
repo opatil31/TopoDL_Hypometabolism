@@ -6,15 +6,11 @@ The only non-standard dependency is ripser for persistent homology. Install
 it with:
 pip install ripser
 """
-
 from __future__ import annotations
-
 from dataclasses import dataclass
-from typing import List, Optional
-
+from typing import List, Optional, Tuple
 import numpy as np
 from ripser import ripser
-
 
 @dataclass
 class TopoKMeansResult:
@@ -22,93 +18,87 @@ class TopoKMeansResult:
     persistence: np.ndarray
     distance_matrix: np.ndarray
     medoids: np.ndarray
-    iterations: int
+    iterations: int      
 
 
 def _rbf_kernel_sum(vec_a: np.ndarray, vec_b: np.ndarray, sigma: float) -> float:
+    # Matches R: sum(kernelMatrix(rbfdot(sigma), x=as.matrix(vec_a), y=as.matrix(vec_b)))
     diff = vec_a[:, None] - vec_b[None, :]
     return float(np.exp(-sigma * diff * diff).sum())
 
 
-def _compute_neighbors(
-    data: np.ndarray, n_knn: int, dist_matrix: bool, preserve_ordering: bool
-) -> tuple[List[np.ndarray], float]:
-    n_samples = data.shape[0]
-    k = max(1, min(n_knn, n_samples))
-
-    if dist_matrix:
-        sorted_indices = np.argsort(data, axis=1)
-        neighbor_indices = [row[:k] for row in sorted_indices]
-        sorted_distances = np.sort(data, axis=1)
-        max_scale = float(sorted_distances[:, k - 1].max())
-    elif preserve_ordering:
-        neighbor_indices = []
-        half_window = k // 2
-        for i in range(n_samples):
-            start = max(0, i - half_window)
-            stop = min(n_samples, i + half_window + 1)
-            neighbor_indices.append(np.arange(start, stop))
-        max_scale = float(data.max())
-    else:
-        diffs = data[:, None, :] - data[None, :, :]
-        distances = np.linalg.norm(diffs, axis=2)
-        sorted_indices = np.argsort(distances, axis=1)
-        neighbor_indices = [row[:k] for row in sorted_indices]
-        gathered = np.take_along_axis(distances, sorted_indices[:, k - 1 : k], axis=1)
-        max_scale = float(gathered.max())
-
-    return neighbor_indices, max_scale
-
-
-def _build_diagram(
-    subset: np.ndarray, *, distance_matrix: bool, max_dimension: int, max_scale: float
-) -> np.ndarray:
-    thresh = max(max_scale, 1e-12)
-    dgms = ripser(
-        subset,
-        maxdim=max_dimension,
-        thresh=thresh,
-        distance_matrix=distance_matrix,
-    )["dgms"]
-
-    rows: List[List[float]] = []
-    for dim, diagram in enumerate(dgms):
-        if diagram.size == 0:
-            continue
-        births_deaths = np.asarray(diagram)
-        deaths = births_deaths[:, 1]
-        deaths = np.where(np.isinf(deaths), max_scale, deaths)
-        for birth, death in zip(births_deaths[:, 0], deaths):
-            rows.append([float(dim), float(birth), float(death)])
-    if not rows:
-        return np.zeros((0, 3), dtype=float)
-    return np.vstack(rows)
-
-
-def _k_medoids(distance: np.ndarray, n_clusters: int, random_state: Optional[int]) -> tuple[np.ndarray, np.ndarray, int]:
-
+def _kmeans_dist_fcps(
+    distance: np.ndarray,
+    n_clusters: int,
+    random_restarts: int = 1,
+    max_iter: int = 2000,
+    random_state: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray, int]:
     rng = np.random.default_rng(random_state)
-    n_samples = distance.shape[0]
-    medoids = rng.choice(n_samples, size=n_clusters, replace=False)
-    labels = np.argmin(distance[:, medoids], axis=1)
+    n = distance.shape[0]
+    if distance.shape[1] != n:
+        raise ValueError("distance must be square.")
 
-    for iteration in range(1, 301):
-        new_medoids = medoids.copy()
-        for cluster_id in range(n_clusters):
-            cluster_points = np.where(labels == cluster_id)[0]
-            if cluster_points.size == 0:
-                continue
-            intra = distance[np.ix_(cluster_points, cluster_points)]
-            costs = intra.sum(axis=1)
-            best_idx = cluster_points[np.argmin(costs)]
-            new_medoids[cluster_id] = best_idx
+    if n_clusters < 1 or n_clusters > n:
+        raise ValueError("n_clusters must be in [1, n_samples].")
+    random_restarts = int(max(1, random_restarts))
+    max_iter = int(max(1, max_iter))
 
-        labels = np.argmin(distance[:, new_medoids], axis=1)
-        if np.array_equal(new_medoids, medoids):
-            return labels, medoids, iteration
-        medoids = new_medoids
+    best_sse = np.inf
+    best_labels = None
+    best_centers = None
+    best_iters = 0
 
-    return labels, medoids, 300
+    for _trial in range(random_restarts):
+        centers = rng.choice(n, size=n_clusters, replace=False)
+
+        prev_labels = None
+        labels = None
+        it = 0
+
+        while True:
+            it += 1
+            if it > max_iter:
+                break
+                
+            dists2centers = distance[np.ix_(centers, np.arange(n))]  # shape (k, n)
+            labels = np.argmin(dists2centers, axis=0)  # 0..k-1
+
+            if prev_labels is not None and np.array_equal(labels, prev_labels):
+                break
+            prev_labels = labels.copy()
+
+            new_centers = centers.copy()
+            sse_per_cluster = np.zeros(n_clusters, dtype=float)
+
+            for ci in range(n_clusters):
+                in_cluster = np.where(labels == ci)[0]
+                if in_cluster.size == 0:
+                    # FCPS leaves center as-is if cluster empty
+                    continue
+
+                in_dist = distance[np.ix_(in_cluster, in_cluster)]
+                if in_cluster.size > 1:
+                    # FCPS uses rowMeans(inClustDist)
+                    mean_d = in_dist.mean(axis=1)
+                else:
+                    mean_d = np.array([float(in_dist.mean())])
+
+                best_local = in_cluster[int(np.argmin(mean_d))]
+                new_centers[ci] = best_local
+
+                sse_per_cluster[ci] = float(mean_d.sum())
+
+            centers = new_centers
+
+        total_sse = float(np.sum(sse_per_cluster))
+        if total_sse < best_sse:
+            best_sse = total_sse
+            best_labels = labels.copy()
+            best_centers = centers.copy()
+            best_iters = it
+
+    return best_labels, best_centers, best_iters
 
 
 def topo_kmeans(
@@ -122,6 +112,8 @@ def topo_kmeans(
     null_dim: bool = False,
     first_dim: bool = False,
     random_state: Optional[int] = None,
+    random_restarts: int = 1,
+    max_iter: int = 2000,
 ) -> TopoKMeansResult:
 
     data = np.asarray(data)
@@ -224,14 +216,18 @@ def topo_kmeans(
                 d = (k_sums[i] + k_sums[j] - 2 * cross) ** power
                 distance[i, j] = distance[j, i] = d
 
-    labels, medoids, iterations = _k_medoids(
-        distance, n_clusters=n_clust, random_state=random_state
+    labels, centerids, iterations = _kmeans_dist_fcps(
+        distance,
+        n_clusters=n_clust,
+        random_restarts=random_restarts,
+        max_iter=max_iter,
+        random_state=random_state,
     )
 
     return TopoKMeansResult(
         labels=labels,
         persistence=persistence,
         distance_matrix=distance,
-        medoids=medoids,
+        medoids=centerids,
         iterations=iterations,
     )
