@@ -1,5 +1,6 @@
 import pydicom as pdc
 import os
+import re
 import numpy as np
 import nibabel as nib
 
@@ -55,7 +56,7 @@ def get_patient_data_parallel(args):
 
 def get_cohort_data(cohort_dir, normalize=False):
     '''
-    Get image data for a given cohort. ADNI's download format is expected
+    Get image data for a given cohort. ADNI's PET download format is expected
     '''
                         
     with Pool() as pool:
@@ -71,27 +72,33 @@ def get_cohort_data(cohort_dir, normalize=False):
     return np.concatenate(imgs, axis=0), np.concatenate(img_ids), np.concatenate(patient_info)
 
 
-def get_normalized_data(norm_nii_dir, prefix='norm_', normalize=False):
+def get_normalized_data(norm_nii_dir, img_id_pattern='norm_'):
     '''
     Get PET scan data that has been normalized to a common space.
     prefix: The prefix
     '''
     imgs = []
     img_ids = []
-    patient_info = []
+
     for img_name in os.listdir(norm_nii_dir):
         img = nib.load(os.path.join(norm_nii_dir, img_name))
-        img_name_split = img_name.lstrip('norm_').split('-')
-        img_id, patient_id = img_name_split[:2]
+
+        img_id = re.search(img_id_pattern, img_name).group(1)
+        # img_name_split = img_name.lstrip('norm_').split('-')
+        # img_id, patient_id = img_name_split[:2]
         
-        imgs.append(mean_normalize(img.get_fdata()) if normalize else img.get_fdata())
+        imgs.append(img.get_fdata())
         img_ids.append(img_id)
-        patient_info.append(patient_id)
         
-    return np.array(imgs), np.array(img_ids), np.array(patient_info)
+    return np.array(imgs), np.array(img_ids)
 
 
 def mean_normalize(img):
     '''Globally scale an entire scan by dividing it by its mean'''
     return img / img.mean()
+
+
+def scale_normalize(arr, tmin, tmax):
+    amin, amax = arr.min(), arr.max()
+    return ((arr - amin) / (amax - amin)) * (tmax - tmin) + tmin
 

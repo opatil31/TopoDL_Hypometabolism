@@ -1,30 +1,53 @@
 import time
 import h5py
 import torch
+import os
+import re
+import nibabel as nib
 import pandas as pd
 import numpy as np
+from tqdm import tqdm
 from torch import nn
 from torch.nn import functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 
-from adni_util import get_normalized_data
+from adni_util import scale_normalize
 
 CDR_MAX_SCORE = 18
 
+def create_hdf5_dataset(imgs_path, out_file_path, img_id_pattern):
+    '''images should all be of the same shape'''
+    dataset = None
+    img_names = os.listdir(imgs_path)
+    n_images = len(img_names)
 
 
-def create_cohort_hdf5(hdf5_path, nii_dir, normalize=False):
-    '''
-    hdf5_path: path to the new HDF5 file to consolidate data into
-    nii_dir: directory containing the data as nii files.
-    normalize: whether to normalize the images or not before writing
-    '''
-    imgs, img_ids, patient_info = get_normalized_data(nii_dir, normalize=normalize)
+    with h5py.File(out_file_path, 'w') as f:
+        img_ids = f.create_dataset('img_ids', (n_images,), dtype=np.int64)
+        img_ids[:] = np.array([int(re.search(img_id_pattern, img_name).group(1)) for img_name in img_names])
+                
+        for i, img_name in tqdm(list(enumerate(img_names))):
+            img_path = os.path.join(imgs_path, img_name)
+            img_data = nib.load(img_path).get_fdata()
 
-    with h5py.File(hdf5_path, 'w') as f:
-        f.create_dataset('imgs', data=imgs)
-        f.create_dataset('img_ids', data=np.array(img_ids, dtype=int))
-        f.create_dataset('patient_info', data=np.array(patient_info, dtype='S'))
+            if 'imgs' not in f:
+                dataset = f.create_dataset('imgs', ((n_images,) + img_data.shape), dtype=np.float16)
+            dataset[i] = img_data
+
+
+
+# def create_cohort_hdf5(hdf5_path, nii_dir, normalize=False):
+#     '''
+#     hdf5_path: path to the new HDF5 file to consolidate data into
+#     nii_dir: directory containing the data as nii files.
+#     normalize: whether to normalize the images or not before writing
+#     '''
+#     imgs, img_ids, patient_info = get_normalized_data(nii_dir, normalize=normalize)
+
+#     with h5py.File(hdf5_path, 'w') as f:
+#         f.create_dataset('imgs', data=imgs)
+#         f.create_dataset('img_ids', data=np.array(img_ids, dtype=int))
+#         f.create_dataset('patient_info', data=np.array(patient_info, dtype='S'))
         
 
 class PETDataset(Dataset):
@@ -57,7 +80,6 @@ class PETDataset(Dataset):
             self.imgs = np.clip(self.imgs, 0., 1.)
         
         self.cdr_scores = (self.all_cohorts_df.loc[self.img_ids]['CDRSB'] / CDR_MAX_SCORE).to_numpy().astype(np.float32)
-
     
     
     def __len__(self):
@@ -71,27 +93,44 @@ class PETDataset(Dataset):
     
     
 class PETsMRIDataset(Dataset):
-    
-    def __init__(self, pet_hdf5_path, mri_hdf5_path, all_cohorts_path, diagnosis=3, noramalize='scale'):
-        '''
-        
-        '''
-        # Read data from files
+    def __init__(self, pet_hdf5_path, mri_hdf5_path, all_cohorts_path, diagnosis=3, normalize='scale', in_memory=False):
         self.pet_hdf5_path = pet_hdf5_path
         self.mri_hdf5_path = mri_hdf5_path
-        self.pet_hdf5_file = h5py.File(self.pet_hdf5_path, 'r')
-        self.mri_hdf5_file = h5py.File(self.mri_hdf5_path, 'r')
+        self.normalize = normalize
+
+        self.pet_hdf5 = h5py.File(pet_hdf5_path, 'r')
+        self.mri_hdf5 = h5py.File(mri_hdf5_path, 'r')
+
+        all_cohorts_df = pd.read_csv(all_cohorts_path, index_col=0)
+        self.data_df = all_cohorts_df[all_cohorts_df['DIAGNOSIS'] == diagnosis]
+        self.data_df = self.data_df[(~self.data_df['CDRSB'].isna()) & (self.data_df['image_id_pet'] != 418607)]
+
+        if self.data_df['image_id_pet'].nunique() != len(self.data_df):
+            raise ValueError(f'PET image ID column (image_id_pet) in "{all_cohorts_path}" should be unique!')
+
+        self.pet_id_to_ind = {int(img_id): i for i, img_id in enumerate(self.pet_hdf5['img_ids'])}
+        self.mri_id_to_ind = {int(img_id): i for i, img_id in enumerate(self.mri_hdf5['img_ids'])}
+
+        self.mri_imgs = self.mri_hdf5['imgs'][:] if in_memory else self.mri_hdf5['imgs']
+        self.pet_imgs = self.pet_hdf5['imgs'][:] if in_memory else self.pet_hdf5['imgs']
         
-        # Unique PET images are matched to their closest sMRI image; therefore the sMRI image ID column is not unique
-        self.all_cohorts_df = pd.read_csv(all_cohorts_path).set_index('image_id_pet')         
-        # Get image data
-        self.pet_imgs = self.pet_hdf5_file['imgs'][:].astype(np.float32)
-        self.mri_imgs = self.mri_hdf5_file['imgs'][:].astype(np.float32)
+    
+    def __len__(self):
+        return len(self.data_df)
+    
+
+    def __getitem__(self, idx):
+        row = self.data_df.iloc[idx]
+        pet_id, mri_id = row['image_id_pet'], row['image_id_mri']
         
-        # Filter the image IDs: HDF5 file does not account for missing EXAMDATE, VISDATE, or CDRSB; but cohorts DataFrame does
-        # Image IDs that have not been filtered:
-        self.all_pet_img_ids = pd.Index(np.array(self.pet_hdf5_file.get('img_ids')).astype(int))
-        self.all_mri_img_ids = pd.Index(np.array(self.mri_hdf5_file.get('img_ids')).astype(int))
+        pet_img = torch.from_numpy(self.pet_imgs[self.pet_id_to_ind[pet_id]].astype(np.float32)).unsqueeze(0)
+        mri_img = torch.from_numpy(self.mri_imgs[self.mri_id_to_ind[mri_id]].astype(np.float32)).unsqueeze(0)
+
+        if self.normalize == 'scale':
+            pet_img = scale_normalize(pet_img, 0, 1)
+            mri_img = scale_normalize(mri_img, 0, 1)
+
+        return pet_img, mri_img, np.atleast_1d(row['CDRSB']).astype(np.float32) / CDR_MAX_SCORE
 
 
 class cVAE_MNIST(nn.Module):
@@ -247,10 +286,112 @@ class cVAE_PET(nn.Module):
         x_hat = self.decode(z, y) 
         return x_hat, mu, logvar
     
+
+class BimodalCVAE(nn.Module):
+
+    def __init__(self, latent_dim, cond_dim):
+        super().__init__()
+
+        self.latent_dim = latent_dim
+        self.cond_dim = cond_dim
+
+        self.x1_encoder = nn.Sequential(
+            nn.Conv3d(1, 16, (5,5,5), stride=2),
+            nn.ReLU(),
+            nn.Conv3d(16, 16, (5,5,5), stride=3),
+            nn.ReLU()
+        )
+
+        self.x2_encoder = nn.Sequential(
+            nn.Conv3d(1, 16, (5,5,5), stride=2),
+            nn.ReLU(),
+            nn.Conv3d(16, 16, (5,5,5), stride=3),
+            nn.ReLU()
+        )
+
+        self.fused_encoder = nn.Sequential(
+            nn.Conv3d(16*2, 128, (5,5,5), stride=3),
+            nn.ReLU(),
+            nn.Conv3d(128, 128, (3,3,3)),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(5760, 64),
+            nn.ReLU()
+        )
+
+        self.encoder_mu = nn.Linear(64+cond_dim, latent_dim)
+        self.encoder_var = nn.Linear(64+cond_dim, latent_dim)
+
+        self.fused_decoder1 = nn.Sequential(
+            nn.Linear(latent_dim+cond_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 5760),
+            nn.ReLU()
+        )
+
+        self.fused_decoder2 = nn.Sequential(
+            nn.ConvTranspose3d(128, 128, (3,3,3)),
+            nn.ReLU(),
+            nn.ConvTranspose3d(128, 16*2, (5,5,5), stride=3, output_padding=(2,0,2)),
+            nn.ReLU()
+        )
+
+        self.x1_decoder = nn.Sequential(
+            nn.ConvTranspose3d(16, 16, (5,5,5), stride=3),
+            nn.ReLU(),
+            nn.ConvTranspose3d(16, 1, (5,5,5), stride=2),
+            nn.Sigmoid()
+        )
+
+        self.x2_decoder = nn.Sequential(
+            nn.ConvTranspose3d(16, 16, (5,5,5), stride=3),
+            nn.ReLU(),
+            nn.ConvTranspose3d(16, 1, (5,5,5), stride=2),
+            nn.Sigmoid()
+        )
+
+
+    def encode(self, x1, x2, c):
+        h1 = self.x1_encoder(x1)
+        h2 = self.x2_encoder(x2)
+        h = torch.cat([h1, h2], dim=1)
+        h_fused = self.fused_encoder(h)
+
+        h_c = torch.cat([h_fused, c], dim=1)
+        mu = self.encoder_mu(h_c)
+        logvar = self.encoder_var(h_c)
+        return mu, logvar
+
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(logvar/2.)
+        epsilon = torch.randn_like(std)
+        return mu + std*epsilon
+    
+
+    def decode(self, z, c):
+        z_c = torch.cat([z, c], dim=1)
+        h_fused = self.fused_decoder1(z_c)
+        h_fused = h_fused.view(-1, 128, 3, 5, 3)
+        h_fused = self.fused_decoder2(h_fused)
+
+        h1, h2 = torch.split(h_fused, 16, dim=1)
+        xhat1 = self.x1_decoder(h1)
+        xhat2 = self.x2_decoder(h2)
+
+        return xhat1, xhat2
+
+
+    def forward(self, x1, x2, c):
+        mu, logvar = self.encode(x1, x2, c)
+        z = self.reparameterize(mu, logvar)
+        xhat1, xhat2 = self.decode(z, c)
+        return xhat1, xhat2, mu, logvar
     
     
     
-def train_model(model, optimizer, dataset, loss_fn, epochs, batch_size, save_freq=None, save_path=None, scheduler=None, device='cpu'):
+    
+def train_cvae(model, optimizer, dataset, loss_fn, epochs, batch_size, save_freq=None, save_path=None, scheduler=None, device='cpu'):
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     model.train()
     
@@ -298,6 +439,73 @@ def train_model(model, optimizer, dataset, loss_fn, epochs, batch_size, save_fre
 #         print(f'F1 score: {f1}')
 
 
+def train_bimodal_cvae(model, optimizer, dataset, loss_fn, epochs, batch_size, val_dataset=None, save_freq=None, save_path=None, scheduler=None, device='cpu', verbose=0):
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    model.train()
+    
+    validate = (val_dataset is not None)
+    
+    vprint = (
+        print if verbose == 2 else lambda *args, **kwargs: None
+    )
+
+    progress_bar = (
+        tqdm if verbose == 1 else lambda x: x
+    )
+    
+    vprint(f'Learning rate: {optimizer.param_groups[0]["lr"]}')
+    vprint(f'Scheduler: {scheduler}' if scheduler else 'No learning rate scheduling!')
+    vprint(f'Training for {epochs} epochs, with batch size={batch_size}')
+    vprint(f'Using device: {device}')
+    vprint(f'Saving model every {save_freq} epochs to {save_path}' if save_freq else 'WARNING: Will not save model!')
+
+    for e in progress_bar(list(range(epochs))):
+        losses = []
+        # all_pred, all_true = [], []
+        t = time.time()
+        vprint(f'\n-----Epoch {e+1}/{epochs}-----')
+        for i, (pet, mri, cdr) in enumerate(loader):
+            optimizer.zero_grad()
+            pet = pet.to(device)
+            mri = mri.to(device)
+            cdr = cdr.to(device)
+
+            pet_hat, mri_hat, mu, logvar = model(pet, mri, cdr)
+            loss = loss_fn(pet, mri, pet_hat, mri_hat, mu, logvar)
+            loss.backward()
+            optimizer.step()
+
+            losses.append(loss.item())
+            # all_pred.append(pred.detach().cpu())
+            # all_true.append(labels.cpu())
+
+            if len(losses) == 8 or i == len(loader)-1:
+                elapsed = time.time() - t
+                # pred_temp = torch.cat(all_pred)
+                # true_temp = torch.cat(all_true)
+
+                vprint(f'Batch {i+1}/{len(loader)} | loss: {np.mean(losses)} ({elapsed:.3f}s)', end='\n')
+                    
+                model.train()
+                t = time.time()
+                losses = []
+                
+        if validate:
+            # val_loss, val_acc, val_f1, val_auc = test_model(model, loss_fn, val_dataset, device=device, multiclass=multiclass)
+            # vprint(f'Validation: val loss: {val_loss:.3f} | val acc: {val_acc:.3f} | val F1: {val_f1:.3f} | val AUC: {val_auc:.3f}')
+            # model.train()
+            vprint()
+        else:
+            vprint()
+                
+        if scheduler is not None:
+            scheduler.step()
+            
+        if save_freq and ((e+1) % save_freq == 0 or e == epochs-1):
+            save_model(save_path, model, optimizer, epochs)
+            vprint(f'Saved to {save_path}')
+
+
 def cvae_loss_fn(x, x_hat, mu, logvar):
     bce_loss = F.binary_cross_entropy(x_hat, x, reduction='none')
     bce_loss = torch.mean(torch.sum(bce_loss, dim=(1,2,3,4)))
@@ -307,6 +515,11 @@ def cvae_loss_fn(x, x_hat, mu, logvar):
     kld_loss = torch.mean(-0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1))
     print(f'kld: {kld_loss}, bce: {bce_loss}')
     return bce_loss + kld_loss
+
+
+def bimodal_cvae_loss_fn(x1, x2, xhat1, xhat2, mu, logvar):
+    # TODO: KLD loss is currently double counted. Fix?
+    return cvae_loss_fn(x1, xhat1, mu, logvar) + cvae_loss_fn(x2, xhat2, mu, logvar) 
 
 
 def save_model(save_path, model, optimizer, epoch):
@@ -323,3 +536,28 @@ def load_model(model, save_path, strict=True):
     checkpoint = torch.load(save_path, weights_only=True)
     model.load_state_dict(checkpoint['model_state_dict'], strict=strict)
     return model
+
+
+def predict_bimodal_latent(model, dataset, idxs=None, device='cpu'):
+    '''
+    Predict the model on a given dataset, and return the predicted categories or logits.
+    
+    :param model: The GNN model to predict. 
+    :param dataset (torch_geometric.data.Dataset):
+    :param idxs (list or array of int): The indexes of the data to predict for, or None to predict for the entire dataset. Default: None
+    :param logits: If True, return a 1D int array containing categorical predicts; if False, return logits of size (N x num_categories)
+    
+    :return (np.ndarray): 1D array containing the categorical predictions for the data, in order of idxs.
+    '''
+    chunksize = 128
+    all_mu, all_logvar = [], []
+    loader = DataLoader(dataset if idxs is None else Subset(dataset, idxs), batch_size=chunksize, shuffle=False)
+    model.eval()
+    with torch.no_grad():
+        for pet, mri, cdr in tqdm(loader):
+            pet, mri, cdr = pet.to(device), mri.to(device), cdr.to(device)
+            mu, logvar = model.encode(pet, mri, cdr)
+            all_mu.append(mu)
+            all_logvar.append(logvar)
+        
+        return torch.cat(all_mu), torch.cat(all_logvar)
