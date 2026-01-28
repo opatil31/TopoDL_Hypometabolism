@@ -7,15 +7,16 @@ from scipy import stats
 from demographics import create_merged_table, merge_tables, get_age_and_education
 
 # Post-hoc analysis
-PET_METADATA_PATH = 'All_Preprocessed_PET.csv'
-DEMOGRAPHIC_PATH = 'All_Subjects_Demographic.csv'
-CDRSB_PATH = 'All_Subjects_CDR.csv'
-MMSE_PATH = 'MMSE.csv'
-MOCA_PATH = 'MOCA.csv'
-AV45_PATH = 'All_Subjects_UCBERKELEY_AMY_6MM.csv'
-APOE_PATH = 'All_Subjects_APOERES.csv'
-PHC_PATH = 'ADSP_PHC_COGN.csv'
-CSF_PATH = 'All_Subjects_UPENNBIOMK_ROCHE_ELECSYS.csv'
+PET_METADATA_PATH = 'adni-tables/All_Preprocessed_PET.csv'
+DEMOGRAPHIC_PATH = 'adni-tables/All_Subjects_Demographic.csv'
+DXSUM_PATH = 'adni-tables/All_Subjects_DXSUM.csv'
+CDRSB_PATH = 'adni-tables/All_Subjects_CDR.csv'
+MMSE_PATH = 'adni-tables/MMSE.csv'
+MOCA_PATH = 'adni-tables/MOCA.csv'
+AV45_PATH = 'adni-tables/All_Subjects_UCBERKELEY_AMY_6MM.csv'
+APOE_PATH = 'adni-tables/All_Subjects_APOERES.csv'
+PHC_PATH = 'adni-tables/ADSP_PHC_COGN.csv'
+CSF_PATH = 'adni-tables/All_Subjects_UPENNBIOMK_ROCHE_ELECSYS.csv'
 
 def diff_month(d1, d2):
     return (d1.year - d2.year) * 12 + d1.month - d2.month
@@ -105,7 +106,7 @@ def km_curve(events, num):
 def get_ad_baseline_ids():
     '''Get image IDs for patients diagnosed with AD at baseline'''
     pet = pd.read_csv(PET_METADATA_PATH, parse_dates=['image_date'])
-    dxsum = pd.read_csv('All_Subjects_DXSUM.csv', parse_dates=['EXAMDATE'])
+    dxsum = pd.read_csv(DXSUM_PATH, parse_dates=['EXAMDATE'])
     
     df = create_merged_table(pet, dxsum, 'subject_id', 'PTID', 'image_date', 'EXAMDATE', how='inner')
     df = df[((df['VISCODE2'] == 'bl') | (df['VISCODE2'] == 'sc')) & (df['DIAGNOSIS'] == 3.0)]
@@ -116,7 +117,7 @@ def get_ad_baseline_ids():
 def get_amy_positive_ids():
     amy = pd.read_csv(AV45_PATH, parse_dates=['SCANDATE'])
     pet = pd.read_csv(PET_METADATA_PATH, parse_dates=['image_date'])
-    dxsum = pd.read_csv('All_Subjects_DXSUM.csv', parse_dates=['EXAMDATE'])
+    dxsum = pd.read_csv(DXSUM_PATH, parse_dates=['EXAMDATE'])
     
     df = create_merged_table(pet, amy, 'subject_id', 'PTID', 'image_date', 'SCANDATE', how='inner')
     df = create_merged_table(df, dxsum, 'subject_id', 'PTID', 'image_date', 'EXAMDATE', how='inner')
@@ -186,11 +187,11 @@ def run_group_tests(vars_df, var_names, test_names):
 
     return f_vals, p_vals, means, stds
 
-def run_pairwise_tests(vars_df, var_names):
+def run_pairwise_tests(vars_df, var_names, n_clust=4):
     '''Run pairwise Welch t-test for each pair of subtypes'''
     data = {}
     cluster_groups = vars_df.groupby('cluster')
-    for clust_a, clust_b in itertools.combinations([0,1,2,3], r=2):
+    for clust_a, clust_b in itertools.combinations(list(range(n_clust)), r=2):
         data[f'{clust_a} vs {clust_b}'] = []
         for var_name in var_names:
             var_a = cluster_groups.get_group(clust_a)[var_name].tolist()
@@ -204,7 +205,7 @@ def run_pairwise_tests(vars_df, var_names):
 
 def run_group_conversion_test(vars_df, mci_baseline=False):
 #     all_cohorts = pd.read_csv(all_cohorts_path, parse_dates=['EXAMDATE'])
-    dxsum = pd.read_csv('All_Subjects_DXSUM.csv', parse_dates=['EXAMDATE'])
+    dxsum = pd.read_csv(DXSUM_PATH, parse_dates=['EXAMDATE'])
     times = []
     means, stds = [], []
 
@@ -227,7 +228,7 @@ def run_group_conversion_test(vars_df, mci_baseline=False):
 
 
 def run_pairwise_conversion_tests(vars_df):
-    dxsum = pd.read_csv('All_Subjects_DXSUM.csv', parse_dates=['EXAMDATE'])
+    dxsum = pd.read_csv(DXSUM_PATH, parse_dates=['EXAMDATE'])
     data = {}
     
     for clust_a, clust_b in itertools.combinations([0,1,2,3], r=2):

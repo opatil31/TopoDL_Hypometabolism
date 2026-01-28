@@ -98,7 +98,18 @@ def mean_normalize(img):
     return img / img.mean()
 
 
-def scale_normalize(arr, tmin, tmax):
-    amin, amax = arr.min(), arr.max()
+def scale_normalize(arr, tmin, tmax, batched=False):
+    '''
+    Min-max scale an image so its min value is `tmin` and max value is `tmax`. If `batched` is True,
+    then `arr` is a collection of images that all must be normalized simultaneously, of size (N, d1, d2, d3)
+    where N is the batch size.
+    
+    arr must be a numpy array
+    '''
+    if batched:
+        amin, amax = arr.min(axis=(1,2,3), keepdims=True), arr.max(axis=(1,2,3), keepdims=True)
+    else:
+        amin, amax = arr.min(), arr.max()
     return ((arr - amin) / (amax - amin)) * (tmax - tmin) + tmin
+
 
